@@ -1,0 +1,19 @@
+# Default Configuration for NeuroCompressor
+
+model:
+  backend: "openai"  # Options: openai, huggingface, anthropic
+  model_name: "gpt-3.5-turbo"  # Model name for the selected backend
+  api_key: null  # Set via environment variable or here
+  kwargs: {}  # Additional model-specific parameters
+
+compression:
+  strategy: "semantic"  # Options: semantic, token, hybrid
+  compression_ratio: 0.5  # Target compression ratio (0.0 to 1.0)
+  chunk_size: 1000  # Size of text chunks for processing
+  overlap: 100  # Overlap between chunks
+  preserve_format: true  # Whether to preserve formatting
+
+decompression:
+  strategy: "semantic"  # Options: semantic, token, hybrid
+  preserve_style: true  # Whether to preserve original writing style
+
