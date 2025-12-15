@@ -1,9 +1,3 @@
-"""
-Utility Functions Module
-
-This module provides various utility functions for the NeuroCompressor project.
-"""
-
 import os
 import json
 import logging

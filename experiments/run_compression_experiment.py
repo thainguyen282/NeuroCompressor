@@ -5,9 +5,10 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from neurocompressor import TextCompressor, TextDecompressor, LLMModel
+from neurocompressor import TextCompressor, TextDecompressor
 from neurocompressor.utils import setup_logging, load_config, save_results, read_text_file
 from neurocompressor.metrics import calculate_metrics, print_metrics
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def main():
@@ -23,8 +24,22 @@ def main():
     config = load_config(args.config)
     input_text = read_text_file(args.input)
     print(f"Loaded input text: {len(input_text)} characters")
-    model = LLMModel(**config.get("model", {}))
-    compressor = TextCompressor(model=model, **config.get("compression", {}))
+    
+    # Load model and tokenizer externally
+    model_config = config.get("model", {})
+    model_name = model_config.get("model_name", "gpt2")  # Default fallback
+    print(f"Loading model: {model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    print(f"Model loaded successfully.")
+    
+    # Initialize compressor with external model and tokenizer
+    compression_config = config.get("compression", {})
+    compressor = TextCompressor(
+        model=model,
+        tokenizer=tokenizer,
+        **compression_config
+    )
     
     print("\nCompressing text...")
     compression_result = compressor.compress(
@@ -38,19 +53,16 @@ def main():
     print(f"  Compressed length: {compression_result['compressed_length']} characters")
     print(f"  Compression ratio: {compression_result['compression_ratio']:.4f}")
     
-    # Initialize decompressor
+    # Initialize decompressor (Note: TextDecompressor may need updating to accept model/tokenizer)
     decompression_config = config.get("decompression", {})
-    decompressor = TextDecompressor(
-        model=model,
-        decompression_strategy=decompression_config.get("strategy", "semantic")
-    )
+    # For now, decompressor can use the compressor's decompress method
+    # Or update TextDecompressor similarly if needed
     
-    # Decompress text
+    # Decompress text using compressor's decompress method
     print("\nDecompressing text...")
-    decompressed_text = decompressor.decompress(
+    decompressed_text = compressor.decompress(
         compression_result,
-        target_length=compression_result.get("original_length"),
-        preserve_style=decompression_config.get("preserve_style", True)
+        max_new_tokens=None
     )
     
     print(f"Decompression completed:")
