@@ -341,19 +341,15 @@ class TextCompressor:
     def _reconstruct_text(self, compressed_input_ids: torch.Tensor, original_input_ids: torch.Tensor) -> str:
         """
         Reconstruct text from compressed version using the model.
-        This version uses KV caching (past_key_values) instead of repeatedly
-        re-encoding long prefixes, and it still ignores special tokens at the
-        start/end for masking decisions.
+        For sequence-based reconstruction, this mirrors the token-level mechanism
+        used in `TextDecompressor._decompress_sequence`:
 
-        Algorithm (single sequence):
-        - Walk left-to-right through `compressed_input_ids`, maintaining a cache.
-        - For each position i:
-          * Always advance the cache with the actual token at i, EXCEPT when it is
-            the mask token.
-          * When we encounter a mask token at i, use the logits from the previous
-            step (which predict token i) to compare against the ground-truth
-            `original_input_ids[i]`. If the model cannot reconstruct it, we overwrite
-            the compressed sequence at i with the ground-truth token.
+        - Take the compressed text (with mask tokens) and tokenize it.
+        - Loop left-to-right:
+        * If the token is not the mask token, keep it.
+        * If the token **is** the mask token, generate the next token from
+            the already reconstructed prefix (no natural-language prompt) and use
+            that prediction instead of the mask token.
         """
         device = next(self.model.parameters()).device
         reconstructed_input_ids = compressed_input_ids.clone()
@@ -362,73 +358,52 @@ class TextCompressor:
         mask_token_id = self._get_mask_token_id()
         special_token_ids = self._get_special_token_ids()
 
+
+        # We modify input_ids in-place; no need for a separate copy
         with torch.no_grad():
-            seq = reconstructed_input_ids
-            seq_len = seq.shape[0]
+            
+                seq = reconstructed_input_ids
+                seq_len = seq.shape[0]
+                
+                # Skip leading/trailing special tokens
+                start_idx = 0
+                end_idx = seq_len
+                while start_idx < seq_len and seq[start_idx].item() in special_token_ids:
+                    start_idx += 1
+                while end_idx > start_idx and seq[end_idx - 1].item() in special_token_ids:
+                    end_idx -= 1
 
-            # Skip leading/trailing special tokens for masking decisions,
-            # but still feed them into the model to build correct context.
-            start_idx = 0
-            end_idx = seq_len
-            while start_idx < seq_len and seq[start_idx].item() in special_token_ids:
-                start_idx += 1
-            while end_idx > start_idx and seq[end_idx - 1].item() in special_token_ids:
-                end_idx -= 1
+                for i in range(start_idx, end_idx):
+                    comp_token_id = seq[i].item()
 
-            past_key_values = None
-            last_logits = None  # logits that predict the *current* position
+                    # Skip specials / void tokens
+                    if comp_token_id in special_token_ids or self._is_void_token(comp_token_id):
+                        continue
 
-            for i in range(seq_len):
-                comp_token_id = seq[i].item()
+                    # Prefix up to (but excluding) position i
+                    prefix = seq[max(0, i - self.chunk_size):i].unsqueeze(0)  # [1, i]
+                    if prefix.numel() == 0:
+                        # No context to predict from; can't safely mask
+                        continue
 
-                # Positions outside [start_idx, end_idx) are never masked,
-                # but we still advance the cache with their tokens.
-                if i < start_idx or i >= end_idx or comp_token_id in special_token_ids or self._is_void_token(comp_token_id):
-                    cur_input = seq[i : i + 1].unsqueeze(0).to(device)  # [1, 1]
-                    outputs = self.model(
-                        input_ids=cur_input,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
-                    past_key_values = outputs.past_key_values
-                    last_logits = outputs.logits[:, -1, :]
-                    continue
-
-                # If this is a mask token, use the *previous* logits to predict
-                # what should be here (p(token_i | <tokens before i>)).
-                if comp_token_id == mask_token_id and last_logits is not None:
-                    pred_token_id = int(torch.argmax(last_logits, dim=-1).item())
-                    ground_truth_token = int(original_input_ids[i].item())
-
-                    # Always set the reconstructed sequence to ground truth
-                    seq[i] = ground_truth_token
-
-                    # If the model prediction was wrong, also fix the compressed
-                    # sequence to guarantee losslessness.
-                    if pred_token_id != ground_truth_token:
-                        compressed_input_ids[i] = ground_truth_token
-
-                    # Now advance the cache with the ground-truth token.
-                    cur_input = torch.tensor([[ground_truth_token]], device=device)
-                    outputs = self.model(
-                        input_ids=cur_input,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
-                    past_key_values = outputs.past_key_values
-                    last_logits = outputs.logits[:, -1, :]
-                else:
-                    # Normal (non-mask) content token: feed it through the model
-                    # and keep logits for the next position.
-                    cur_input = seq[i : i + 1].unsqueeze(0).to(device)  # [1, 1]
-                    outputs = self.model(
-                        input_ids=cur_input,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
-                    past_key_values = outputs.past_key_values
-                    last_logits = outputs.logits[:, -1, :]
-
+                    attention_mask = torch.ones_like(prefix, device=device)
+                    if comp_token_id == mask_token_id:
+                        # Generate the next token (greedy) using the already reconstructed prefix
+                        generated = self.model.generate(
+                            prefix,
+                            attention_mask=attention_mask,
+                            max_new_tokens=1,
+                            do_sample=False,
+                            pad_token_id=(
+                                self.tokenizer.pad_token_id
+                                if self.tokenizer.pad_token_id is not None
+                                else self.tokenizer.eos_token_id
+                            ),
+                        )
+                        ground_truth_token = original_input_ids[i].item()
+                        seq[i] = ground_truth_token
+                        if generated[0, -1].item() != ground_truth_token:
+                            compressed_input_ids[i] = ground_truth_token
         compressed_text = self.tokenizer.decode(
             compressed_input_ids, skip_special_tokens=True
         )
